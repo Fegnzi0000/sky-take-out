@@ -6,3 +6,17 @@ sky:
     database: sky_take_out
     username: root
     password: Hyf20050528@
+  alioss:
+    endpoint : oss-cn-guangzhou.aliyuncs.com
+    access-key-id : ${OSS_ACCESS_KEY_ID}
+    access-key-secret : ${OSS_ACCESS_KEY_SECRET}
+    bucket-name : sky-take-out-move
+
+  redis:
+    host : localhost
+    port : 6379
+    database : 10
+
+  wechat:
+    appid : wxc53775238ce842ba
+    secret : ac5f01a168b892eb85630637009f2ed9

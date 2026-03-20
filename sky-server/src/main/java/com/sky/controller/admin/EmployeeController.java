@@ -74,11 +74,11 @@ public class EmployeeController {
         return Result.success();
     }
 
-    /*
-    * 新增员工
-    * @param employeeDTO
-    * @return
-    *  */
+    /**
+     * 新增员工
+     * @param employeeDTO
+     * @return
+     */
     @PostMapping
     @ApiOperation(value = "新增员工")
     public Result save(@RequestBody EmployeeDTO employeeDTO) {
