@@ -35,7 +35,6 @@ public class WebMvcConfiguration extends WebMvcConfigurationSupport {
     private   JwtTokenUserInterceptor jwtTokenUserInterceptor;
     /**
      * 注册自定义拦截器
-     *
      * @param registry
      */
     protected void addInterceptors(InterceptorRegistry registry) {
@@ -43,6 +42,7 @@ public class WebMvcConfiguration extends WebMvcConfigurationSupport {
         registry.addInterceptor(jwtTokenAdminInterceptor)
                 .addPathPatterns("/admin/**")
                 .excludePathPatterns("/admin/employee/login");
+
         registry.addInterceptor(jwtTokenUserInterceptor)
                 .addPathPatterns("/user/**")
                 .excludePathPatterns("/user/user/login")

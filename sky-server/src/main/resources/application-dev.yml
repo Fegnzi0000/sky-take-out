@@ -20,3 +20,15 @@ sky:
   wechat:
     appid : wxc53775238ce842ba
     secret : ac5f01a168b892eb85630637009f2ed9
+    mchid : 1561414331
+    mchSerialNo : 4B3B3DC35414AD50B1B755BAF8DE9CC7CF407606
+    privateKeyFilePath : D:\apiclient_key.pem
+    apiV3Key : CZBK51236435wxpay435434323FFDuv3
+    weChatPayCertFilePath : D:\wechatpay_166D96F876F45C7D07CE98952A96EC980368ACFC.pem
+    notifyUrl : ws://localhost/ws/5dh4m5kybew
+    refundNotifyUrl : https://www.weixin.qq.com/wxpay/pay.php
+
+  shop:
+    address: 广东省广州市广东工业大学大学城校区
+  baidu:
+    ak: r2N9vT32zalr1gulNO89j7JeDicOFjCn

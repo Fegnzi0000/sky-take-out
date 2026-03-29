@@ -18,8 +18,10 @@ import java.time.LocalDateTime;
 @AllArgsConstructor
 public class ShoppingCart implements Serializable {
 
+    //反序列化时校验类版本是否匹配，避免反序列化异常或不兼容。
     private static final long serialVersionUID = 1L;
 
+    //购物车主键id
     private Long id;
 
     //名称
