@@ -72,6 +72,7 @@ public class DishServiceImpl implements DishService {
         return new PageResult(page.getTotal(),page.getResult());
     }
 
+
     /**
      * 菜品批量删除
      * @param ids
