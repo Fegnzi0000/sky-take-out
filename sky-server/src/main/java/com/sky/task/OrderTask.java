@@ -4,6 +4,7 @@ import com.sky.entity.Orders;
 import com.sky.mapper.OrderMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -22,10 +23,21 @@ public class OrderTask {
     private OrderMapper orderMapper;
 
     /**
+     * 支付超时关闭订单的处理模式：
+     * - mq：由RabbitMQ延迟队列驱动（推荐，默认）
+     * - task：由定时任务扫描驱动
+     */
+    @Value("${sky.order.timeout.mode:mq}")
+    private String timeoutMode;
+
+    /**
      * 处理支付超时订单
      */
     @Scheduled(cron = "0 * * * * ?")
     public void processTimeoutOrder(){
+        if (!"task".equalsIgnoreCase(timeoutMode)) {
+            return;
+        }
         log.info("处理支付超时订单：{}",new Date());
 
         LocalDateTime time = LocalDateTime.now().plusMinutes(-15);

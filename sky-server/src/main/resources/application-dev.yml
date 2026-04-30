@@ -32,3 +32,14 @@ sky:
     address: 广东省广州市广东工业大学大学城校区
   baidu:
     ak: r2N9vT32zalr1gulNO89j7JeDicOFjCn
+
+spring:
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    virtual-host: /
+    listener:
+      simple:
+        acknowledge-mode: auto

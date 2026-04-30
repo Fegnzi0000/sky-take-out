@@ -9,6 +9,12 @@ import java.time.LocalDateTime;
 
 @Data
 public class OrdersSubmitDTO implements Serializable {
+    /**
+     * 客户端幂等键（推荐前端每次点击“提交订单”生成一次UUID并传入）。
+     *
+     * <p>用于防止网络重试/重复点击导致重复下单。</p>
+     */
+    private String idempotencyKey;
     //地址簿id
     private Long addressBookId;
     //付款方式

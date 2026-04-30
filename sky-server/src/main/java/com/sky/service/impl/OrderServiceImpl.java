@@ -14,6 +14,9 @@ import com.sky.exception.AddressBookBusinessException;
 import com.sky.exception.OrderBusinessException;
 import com.sky.exception.ShoppingCartBusinessException;
 import com.sky.mapper.*;
+import com.sky.config.RabbitMQConfiguration;
+import com.sky.mq.OrderCreateMessage;
+import com.sky.mq.OrderPreSnapshot;
 import com.sky.result.PageResult;
 import com.sky.service.OrderService;
 import com.sky.websocket.WebSocketServer;
@@ -24,18 +27,22 @@ import com.sky.vo.OrderStatisticsVO;
 import com.sky.vo.OrderSubmitVO;
 import com.sky.vo.OrderVO;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 @Service
@@ -59,6 +66,12 @@ public class OrderServiceImpl implements OrderService {
     @Autowired
     private WebSocketServer webSocketServer;
 
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
     @Value("${sky.shop.address}")
     private String shopAddress;
 
@@ -71,7 +84,6 @@ public class OrderServiceImpl implements OrderService {
      * @return
      */
     @Override
-    @Transactional
     public OrderSubmitVO submitOrder(OrdersSubmitDTO ordersSubmitDTO) {
         //异常情况处理（收货地址为空，超出配送范围，购物车为空）
         AddressBook addressBook = addressBookMapper.getById(ordersSubmitDTO.getAddressBookId());
@@ -89,42 +101,103 @@ public class OrderServiceImpl implements OrderService {
             throw new ShoppingCartBusinessException(MessageConstant.SHOPPING_CART_IS_NULL);
         }
 
-        //构造订单数据
-        Orders orders = new Orders();
-        BeanUtils.copyProperties(ordersSubmitDTO, orders);
-        orders.setPhone(addressBook.getPhone());
-        orders.setAddress(addressBook.getDetail());
-        orders.setConsignee(addressBook.getConsignee());
-        orders.setNumber(String.valueOf(System.currentTimeMillis()));
-        orders.setUserId(userId);
-        orders.setStatus(Orders.PENDING_PAYMENT);
-        orders.setPayStatus(Orders.UN_PAID);
-        orders.setOrderTime(LocalDateTime.now());
-
-        //向订单表插入1条数据
-        orderMapper.insert(orders);
-
-        //订单明细数据
-        List<OrderDetail> orderDetailList = new ArrayList<>();
-        for (ShoppingCart cart:shoppingCartList){
-            OrderDetail orderDetail = new OrderDetail();
-            BeanUtils.copyProperties(cart,orderDetail);
-            orderDetail.setOrderId(orders.getId());
-            orderDetailList.add(orderDetail);
+        // ============ 异步下单改造：Redis预处理 + MQ驱动 ============
+        // 1) 幂等键（推荐前端每次点击提交订单生成UUID传入）
+        String idempotencyKey = ordersSubmitDTO.getIdempotencyKey();
+        if (idempotencyKey == null || idempotencyKey.trim().isEmpty()) {
+            idempotencyKey = UUID.randomUUID().toString();
         }
 
-        //向明细表插入n条数据
-        orderDetailMapper.insertBatch(orderDetailList);
-        //清理购物车中的数据
-        shoppingCartMapper.deleteByUserId(userId);
-        //封装返回结果
-        OrderSubmitVO orderSubmitVO = OrderSubmitVO.builder()
-                .id(orders.getId())
-                .orderNumber(orders.getNumber())
-                .orderAmount(orders.getAmount())
-                .orderTime(orders.getOrderTime())
+        String idemRedisKey = "order:idem:" + userId + ":" + idempotencyKey;
+        String existingOrderNumber = stringRedisTemplate.opsForValue().get(idemRedisKey);
+        if (existingOrderNumber != null && !existingOrderNumber.isEmpty()) {
+            return buildSubmitResult(existingOrderNumber, ordersSubmitDTO.getAmount());
+        }
+
+        // 2) 生成订单号并写入幂等记录（SETNX）
+        // 使用“时间戳 + 随机后缀”降低并发下的碰撞概率（最终仍建议DB对number建唯一索引）
+        String orderNumber = System.currentTimeMillis() + String.valueOf(ThreadLocalRandom.current().nextInt(1000, 10000));
+        Boolean firstSubmit = stringRedisTemplate.opsForValue().setIfAbsent(idemRedisKey, orderNumber, Duration.ofMinutes(30));
+        if (Boolean.FALSE.equals(firstSubmit)) {
+            String orderNo = stringRedisTemplate.opsForValue().get(idemRedisKey);
+            return buildSubmitResult(orderNo == null ? orderNumber : orderNo, ordersSubmitDTO.getAmount());
+        }
+
+        // 3) 将订单快照写入Redis，供消费者落库
+        LocalDateTime orderTime = LocalDateTime.now();
+        OrderPreSnapshot snapshot = OrderPreSnapshot.builder()
+                .userId(userId)
+                .orderNumber(orderNumber)
+                .orderTime(orderTime)
+                .submitDTO(ordersSubmitDTO)
+                .consignee(addressBook.getConsignee())
+                .phone(addressBook.getPhone())
+                .address(addressBook.getDetail())
+                .cartItems(shoppingCartList)
                 .build();
-        return orderSubmitVO;
+
+        String preRedisKey = "order:pre:" + orderNumber;
+        stringRedisTemplate.opsForValue().set(preRedisKey, JSON.toJSONString(snapshot), Duration.ofMinutes(60));
+
+        // 4) 发送MQ消息：异步创建订单（写DB/写明细/清购物车）
+        OrderCreateMessage message = OrderCreateMessage.builder()
+                .messageId(UUID.randomUUID().toString())
+                .userId(userId)
+                .orderNumber(orderNumber)
+                .idempotencyKey(idempotencyKey)
+                .createdAt(orderTime)
+                .build();
+
+        rabbitTemplate.convertAndSend(
+                RabbitMQConfiguration.ORDER_EXCHANGE,
+                RabbitMQConfiguration.ORDER_CREATE_ROUTING_KEY,
+                message
+        );
+
+        // 5) 最佳努力：短暂轮询一下是否已异步落库（不保证一定拿到id）
+        Long orderId = tryGetAsyncOrderId(orderNumber);
+
+        return OrderSubmitVO.builder()
+                .id(orderId)
+                .orderNumber(orderNumber)
+                .orderAmount(ordersSubmitDTO.getAmount())
+                .orderTime(orderTime)
+                .build();
+    }
+
+    private OrderSubmitVO buildSubmitResult(String orderNumber, BigDecimal fallbackAmount) {
+        Long orderId = tryGetAsyncOrderId(orderNumber);
+        return OrderSubmitVO.builder()
+                .id(orderId)
+                .orderNumber(orderNumber)
+                .orderAmount(fallbackAmount)
+                .orderTime(LocalDateTime.now())
+                .build();
+    }
+
+    private Long tryGetAsyncOrderId(String orderNumber) {
+        if (orderNumber == null || orderNumber.isEmpty()) {
+            return null;
+        }
+        String resultKey = "order:result:" + orderNumber;
+        // 最多等待约500ms
+        for (int i = 0; i < 10; i++) {
+            String orderIdStr = stringRedisTemplate.opsForValue().get(resultKey);
+            if (orderIdStr != null && !orderIdStr.isEmpty()) {
+                try {
+                    return Long.valueOf(orderIdStr);
+                } catch (NumberFormatException ignored) {
+                    return null;
+                }
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+        return null;
     }
 
     /**
@@ -167,6 +240,17 @@ public class OrderServiceImpl implements OrderService {
 
         // 根据订单号查询当前用户的订单
         Orders ordersDB = orderMapper.getByNumberAndUserId(outTradeNo, userId);
+
+        // 异步下单场景下：用户可能在订单落库之前就触发支付回调
+        if (ordersDB == null) {
+            Long orderId = tryGetAsyncOrderId(outTradeNo);
+            if (orderId != null) {
+                ordersDB = orderMapper.getById(orderId);
+            }
+        }
+        if (ordersDB == null) {
+            throw new OrderBusinessException("订单不存在或正在创建，请稍后重试");
+        }
 
         // 根据订单id更新订单的状态、支付方式、支付状态、结账时间
         Orders orders = Orders.builder()
