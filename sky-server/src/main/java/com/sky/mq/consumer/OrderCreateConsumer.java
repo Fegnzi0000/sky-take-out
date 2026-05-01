@@ -16,6 +16,7 @@ import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -35,7 +36,6 @@ public class OrderCreateConsumer {
 
     private static final String REDIS_PRE_KEY_PREFIX = "order:pre:";
     private static final String REDIS_RESULT_KEY_PREFIX = "order:result:";
-    private static final String REDIS_MQ_PROCESSED_PREFIX = "order:mq:processed:";
 
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
@@ -60,15 +60,20 @@ public class OrderCreateConsumer {
             return;
         }
 
-        // MQ-level idempotency: avoid duplicate consumption
-        String processedKey = REDIS_MQ_PROCESSED_PREFIX + message.getMessageId();
-        Boolean firstTime = stringRedisTemplate.opsForValue().setIfAbsent(processedKey, "1", Duration.ofDays(1));
-        if (Boolean.FALSE.equals(firstTime)) {
-            log.info("Duplicate OrderCreateMessage ignored, messageId={}", message.getMessageId());
+        String orderNumber = message.getOrderNumber();
+        if (orderNumber == null || orderNumber.isEmpty()) {
+            log.warn("OrderCreateMessage missing orderNumber, messageId={}", message.getMessageId());
             return;
         }
 
-        String orderNumber = message.getOrderNumber();
+        // DB-level idempotency: if order already exists, short-circuit safely.
+        Orders existing = orderMapper.getByNumber(orderNumber);
+        if (existing != null) {
+            stringRedisTemplate.opsForValue()
+                    .set(REDIS_RESULT_KEY_PREFIX + orderNumber, String.valueOf(existing.getId()), Duration.ofHours(1));
+            return;
+        }
+
         String preKey = REDIS_PRE_KEY_PREFIX + orderNumber;
         String snapshotJson = stringRedisTemplate.opsForValue().get(preKey);
         if (snapshotJson == null || snapshotJson.isEmpty()) {
@@ -96,8 +101,17 @@ public class OrderCreateConsumer {
         orders.setPayStatus(Orders.UN_PAID);
         orders.setOrderTime(snapshot.getOrderTime() == null ? LocalDateTime.now() : snapshot.getOrderTime());
 
-        // Insert order
-        orderMapper.insert(orders);
+        // Insert order (guard duplicate insert by DB unique constraint)
+        try {
+            orderMapper.insert(orders);
+        } catch (DuplicateKeyException ex) {
+            Orders dup = orderMapper.getByNumber(orderNumber);
+            if (dup != null) {
+                stringRedisTemplate.opsForValue()
+                        .set(REDIS_RESULT_KEY_PREFIX + orderNumber, String.valueOf(dup.getId()), Duration.ofHours(1));
+            }
+            return;
+        }
 
         // Insert details
         List<ShoppingCart> cartItems = snapshot.getCartItems();
@@ -138,4 +152,3 @@ public class OrderCreateConsumer {
         log.info("Order created asynchronously, orderId={}, orderNumber={}", orders.getId(), orderNumber);
     }
 }
-
