@@ -1,4 +1,4 @@
-# 苍穹外卖（Sky Take Out）
+# MealFlow 智能点餐平台（Sky Take Out）
 
 一个包含用户端与商家端接口的外卖下单系统。后端基于 Spring Boot + MyBatis，结合 Redis 与 RabbitMQ 支持下单、支付、统计报表等业务流程。
 
