@@ -1,5 +1,6 @@
 package com.sky.config;
 
+import com.sky.json.JacksonObjectMapper;
 import org.springframework.amqp.core.Binding;
 import org.springframework.amqp.core.BindingBuilder;
 import org.springframework.amqp.core.DirectExchange;
@@ -89,7 +90,7 @@ public class RabbitMQConfiguration {
 
     @Bean
     public MessageConverter rabbitMessageConverter() {
-        return new Jackson2JsonMessageConverter();
+        return new Jackson2JsonMessageConverter(new JacksonObjectMapper());
     }
 
     /**
