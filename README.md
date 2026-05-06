@@ -80,9 +80,150 @@ sky-take-out/
 - **强耦合问题**：请求线程只做预处理和投递消息，业务解耦更清晰。
 - **超时订单堆积**：延迟队列自动关闭未支付订单。
 
+## 支付流程（微信支付 & 支付宝沙箱）
+
+本项目支付采用“**统一支付入口 + 第三方异步回调驱动订单状态流转**”的方式实现：
+
+- 统一入口：`PUT /user/order/payment`（根据 `payMethod` 选择微信/支付宝）
+- 微信回调：`POST /notify/paySuccess`（微信支付 V3，回调报文需解密）
+- 支付宝回调：`POST /notify/alipay/notify`（支付宝异步通知，需验签）
+
+> 代码位置：
+>
+> - 支付入口：`sky-server/src/main/java/com/sky/controller/user/OrderController.java`
+> - 支付实现：`sky-server/src/main/java/com/sky/service/impl/OrderServiceImpl.java`
+> - 回调接收：`sky-server/src/main/java/com/sky/controller/notify/PayNotifyController.java`
+> - 支付宝工具与配置：`sky-common/src/main/java/com/sky/utils/AlipayUtil.java`、`sky-common/src/main/java/com/sky/properties/AlipayProperties.java`
+> - 微信工具与配置：`sky-common/src/main/java/com/sky/utils/WeChatPayUtil.java`、`sky-common/src/main/java/com/sky/properties/WeChatProperties.java`
+
+### 0）前置：下单与落库是异步的（支付要兼容“订单未落库”）
+
+用户下单时会先把订单快照写入 Redis（`order:pre:{orderNumber}`），再投递 MQ 让消费者异步写库。
+因此出现一种常见时序：**用户已经发起支付/第三方已经回调，但订单可能仍在创建中**。
+
+为此，本项目在支付成功推进状态时，会优先查 DB；若查不到，会尝试从 Redis 的 `order:result:{orderNumber}` 补偿拿到 `orderId` 再查 DB（最佳努力）。
+
+### 1）统一支付入口：用户选择支付方式后怎么执行？
+
+接口：`PUT /user/order/payment`
+
+请求体（`OrdersPaymentDTO`）：
+
+```json
+{
+  "orderNumber": "xxx",
+  "payMethod": 1
+}
+```
+
+- `payMethod = 1`：微信支付
+- `payMethod = 2`：支付宝（沙箱/正式通过 `gatewayUrl` 切换）
+
+服务端返回 `OrderPaymentVO`：
+
+- 微信：返回小程序/JSAPI 调起支付所需字段（`timeStamp`、`nonceStr`、`packageStr`、`paySign`…）
+- 支付宝：返回 `payUrl`（跳转 URL）与 `payForm`（HTML 表单，通常自动提交）
+
+### 2）选择【支付宝】后的流程（沙箱）
+
+#### 2.1 发起支付（后端做什么）
+
+`OrderServiceImpl.payment(...)` 检测到 `payMethod=2` 后：
+
+1. 解析应付金额（优先 DB，其次 Redis 快照，兜底 0.01）
+2. 使用支付宝 SDK 生成 WAP 支付请求：
+   - `payUrl`：适合前端直接跳转
+   - `payForm`：适合网页端直接渲染并自动提交
+
+#### 2.2 支付宝怎么回调？
+
+支付宝支付完成后，会以 **HTTP POST 表单参数** 的方式通知 `notify_url`：
+
+- 回调接口：`POST /notify/alipay/notify`
+- 协议要求：服务端必须返回纯文本 `success` 或 `failure`
+
+#### 2.3 后端怎么接收？接收后做什么处理？
+
+`PayNotifyController.alipayNotify(...)` 的处理步骤：
+
+1. 从 `HttpServletRequest` 提取回调参数 Map
+2. **验签**（核心安全点）：`AlipaySignature.rsaCheckV1(...)`
+3. 校验 `trade_status`：仅 `TRADE_SUCCESS / TRADE_FINISHED` 才推进订单
+4. 调用 `orderService.paySuccess(out_trade_no)` 推进订单状态为“已支付/待接单”
+5. 成功返回 `success`；异常返回 `failure`（让支付宝按策略重试，保证最终一致性）
+
+#### 2.4 为什么要这样做？
+
+- 验签：防止伪造回调导致“假支付成功”
+- 幂等：支付宝可能重复通知；网络抖动也会重试
+- 回调驱动状态：支付结果以第三方通知为准，避免客户端伪造“已支付”
+- 兼容异步下单：回调可能先于落库到达，需要补偿查询
+
+### 3）选择【微信支付】后的流程
+
+#### 3.1 发起支付（后端做什么）
+
+`OrderServiceImpl.payment(...)` 检测到 `payMethod=1` 后：
+
+1. 获取当前登录用户的 `openid`（微信 JSAPI 必需）
+2. 调用 `WeChatPayUtil.pay(...)` 生成预支付交易单
+3. 返回给前端调起支付所需参数（`OrderPaymentVO`）
+
+#### 3.2 微信怎么回调？
+
+微信支付 V3 支付完成后，会回调你配置的 `notifyUrl`，本项目接收接口为：
+
+- 回调接口：`/notify/paySuccess`
+
+> 注意：真实联调时 `notifyUrl` 必须是**公网可访问**的 HTTP/HTTPS 地址。
+
+#### 3.3 后端怎么接收？接收后做什么处理？
+
+`PayNotifyController.paySuccessNotify(...)` 的处理步骤：
+
+1. 读取回调 body
+2. 使用 `apiV3Key` 对回调报文 `resource` 进行 **AES-GCM 解密**
+3. 从解密后的 JSON 取 `out_trade_no`（商户订单号）
+4. 调用 `orderService.paySuccess(out_trade_no)` 推进订单状态
+5. 向微信响应 `{"code":"SUCCESS","message":"SUCCESS"}` 表示已成功处理（否则微信会重试）
+
+#### 3.4 为什么要这样做？
+
+- 回调报文加密：微信 V3 回调需要解密才能取到订单号等字段
+- 必须返回 SUCCESS：否则微信会重试通知，导致重复处理压力
+- 幂等：微信也会重复通知/重试
+
+### 4）支付宝 vs 微信支付：核心区别（总结对比）
+
+| 对比项 | 支付宝（沙箱/正式） | 微信支付（V3） |
+|---|---|---|
+| 发起支付返回给前端 | `payUrl` / `payForm`（跳转/表单） | JSAPI 调起参数（`prepay_id` 等） |
+| 回调地址 | `POST /notify/alipay/notify` | `/notify/paySuccess` |
+| 回调数据安全 | **验签**（RSA2） | **解密**（AES-GCM，`apiV3Key`） |
+| 回调协议响应 | 纯文本 `success/failure` | JSON `{"code":"SUCCESS"...}` |
+| 幂等必要性 | 必须（可能重复通知） | 必须（可能重复通知/重试） |
+| 订单异步落库兼容 | 都需要（可能回调先到） | 都需要（可能回调先到） |
+
+### 5）本地联调配置要点
+
+#### 支付宝沙箱
+
+建议通过环境变量注入密钥（避免提交到仓库），并配置可公网访问的 `notifyUrl`（本地可用内网穿透 ngrok/frp）。
+
+`application-dev.yml` 已提供占位：
+
+- `sky.alipay.gatewayUrl`：默认沙箱网关 `https://openapi-sandbox.dl.alipaydev.com/gateway.do`
+- `sky.alipay.appId / merchantPrivateKey / alipayPublicKey`
+- `sky.alipay.notifyUrl / returnUrl`
+
+#### 微信支付
+
+微信支付回调地址同样需要公网可访问，并确保 `apiV3Key`、证书路径等配置正确。
+
 ## 订单状态机与多支付策略（说明）
 
-> 本段描述基于项目的设计实现，假设以下功能已完成实现。
+> 说明：项目当前已实现 **微信支付 + 支付宝（沙箱）** 的“统一支付入口 + 回调推进状态”。
+> 下文的“状态机/策略模式”更多是对设计思路的归纳总结，可按需要继续抽象落地。
 
 ### 状态机设计（订单生命周期）
 

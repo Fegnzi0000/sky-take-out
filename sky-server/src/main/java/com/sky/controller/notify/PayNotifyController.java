@@ -3,19 +3,23 @@ package com.sky.controller.notify;
 import com.alibaba.druid.support.json.JSONUtils;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONObject;
+import com.sky.utils.AlipayUtil;
 import com.sky.properties.WeChatProperties;
 import com.sky.service.OrderService;
 import com.wechat.pay.contrib.apache.httpclient.util.AesUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.http.entity.ContentType;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.io.BufferedReader;
 import java.nio.charset.StandardCharsets;
+import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.Map;
 
 /**
  * 支付回调相关接口
@@ -28,6 +32,9 @@ public class PayNotifyController {
     private OrderService orderService;
     @Autowired
     private WeChatProperties weChatProperties;
+
+    @Autowired
+    private AlipayUtil alipayUtil;
 
     /**
      * 支付成功回调
@@ -56,6 +63,59 @@ public class PayNotifyController {
 
         //给微信响应
         responseToWeixin(response);
+    }
+
+    /**
+     * 支付宝异步通知（notify_url）
+     *
+     * <p>Alipay requires plain text response: "success" or "failure".</p>
+     */
+    @PostMapping(value = "/alipay/notify", produces = "text/plain")
+    public String alipayNotify(HttpServletRequest request) {
+        Map<String, String> params = extractRequestParams(request);
+        log.info("支付宝异步通知 params={}", params);
+
+        boolean signVerified = alipayUtil.verifyNotifySignature(params);
+        if (!signVerified) {
+            log.warn("支付宝回调验签失败");
+            return "failure";
+        }
+
+        String outTradeNo = params.get("out_trade_no");
+        String tradeStatus = params.get("trade_status");
+        if (outTradeNo == null || outTradeNo.trim().isEmpty()) {
+            log.warn("支付宝回调缺少 out_trade_no");
+            return "failure";
+        }
+
+        // 只有交易成功/结束才推进状态
+        if ("TRADE_SUCCESS".equals(tradeStatus) || "TRADE_FINISHED".equals(tradeStatus)) {
+            try {
+                orderService.paySuccess(outTradeNo);
+            } catch (Exception e) {
+                // 返回 failure 让支付宝重试（常见原因：订单尚未落库/网络抖动等）
+                log.error("处理支付宝回调失败，outTradeNo={}", outTradeNo, e);
+                return "failure";
+            }
+        }
+
+        return "success";
+    }
+
+    private Map<String, String> extractRequestParams(HttpServletRequest request) {
+        Map<String, String> params = new HashMap<>();
+        if (request == null) {
+            return params;
+        }
+        Enumeration<String> names = request.getParameterNames();
+        while (names.hasMoreElements()) {
+            String name = names.nextElement();
+            String value = request.getParameter(name);
+            if (value != null) {
+                params.put(name, value);
+            }
+        }
+        return params;
     }
 
     /**

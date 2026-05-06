@@ -62,6 +62,15 @@ sky:
     weChatPayCertFilePath : ${sky.wechat.weChatPayCertFilePath}
     notifyUrl : ${sky.wechat.notifyUrl}
     refundNotifyUrl : ${sky.wechat.refundNotifyUrl}
+  alipay:
+    appId: ${sky.alipay.appId}
+    merchantPrivateKey: ${sky.alipay.merchantPrivateKey}
+    alipayPublicKey: ${sky.alipay.alipayPublicKey}
+    gatewayUrl: ${sky.alipay.gatewayUrl}
+    notifyUrl: ${sky.alipay.notifyUrl}
+    returnUrl: ${sky.alipay.returnUrl}
+    charset: ${sky.alipay.charset:utf-8}
+    signType: ${sky.alipay.signType:RSA2}
   shop:
     address: ${sky.shop.address}
   baidu:

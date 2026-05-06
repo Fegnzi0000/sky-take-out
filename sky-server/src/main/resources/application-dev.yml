@@ -28,6 +28,19 @@ sky:
     notifyUrl : ws://localhost/ws/5dh4m5kybew
     refundNotifyUrl : https://www.weixin.qq.com/wxpay/pay.php
 
+  # 支付宝沙箱配置（推荐通过环境变量注入敏感信息）
+  alipay:
+    # 沙箱网关：https://openapi-sandbox.dl.alipaydev.com/gateway.do
+    gatewayUrl: https://openapi-sandbox.dl.alipaydev.com/gateway.do
+    appId: ${ALIPAY_APP_ID}
+    merchantPrivateKey: ${ALIPAY_MERCHANT_PRIVATE_KEY}
+    alipayPublicKey: ${ALIPAY_PUBLIC_KEY}
+    # 异步回调：需要外网可访问（本地可用内网穿透，如 ngrok/frp）
+    notifyUrl: ${ALIPAY_NOTIFY_URL:http://localhost:8080/notify/alipay/notify}
+    returnUrl: ${ALIPAY_RETURN_URL:http://localhost:8080}
+    charset: utf-8
+    signType: RSA2
+
   shop:
     address: 广东省广州市广东工业大学大学城校区
   baidu:

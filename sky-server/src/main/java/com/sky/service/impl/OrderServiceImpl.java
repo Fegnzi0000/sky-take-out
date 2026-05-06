@@ -20,6 +20,7 @@ import com.sky.mq.OrderPreSnapshot;
 import com.sky.result.PageResult;
 import com.sky.service.OrderService;
 import com.sky.websocket.WebSocketServer;
+import com.sky.utils.AlipayUtil;
 import com.sky.utils.HttpClientUtil;
 import com.sky.utils.WeChatPayUtil;
 import com.sky.vo.OrderPaymentVO;
@@ -35,6 +36,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -62,6 +64,9 @@ public class OrderServiceImpl implements OrderService {
     private UserMapper userMapper;
     @Autowired
     private WeChatPayUtil weChatPayUtil;
+
+    @Autowired
+    private AlipayUtil alipayUtil;
 
     @Autowired
     private WebSocketServer webSocketServer;
@@ -207,16 +212,39 @@ public class OrderServiceImpl implements OrderService {
      * @return
      */
     public OrderPaymentVO payment(OrdersPaymentDTO ordersPaymentDTO) throws Exception {
-        // 当前登录用户id
+        String orderNumber = ordersPaymentDTO.getOrderNumber();
+        Integer payMethod = ordersPaymentDTO.getPayMethod();
+        if (payMethod == null) {
+            payMethod = 1; // 默认微信
+        }
+
+        BigDecimal payAmount = resolvePayAmount(orderNumber);
+        String subject = "苍穹外卖订单";
+
+        // 支付宝（沙箱/正式环境切换由 gatewayUrl 决定）
+        if (Integer.valueOf(2).equals(payMethod)) {
+            String totalAmount = payAmount.setScale(2, RoundingMode.HALF_UP).toPlainString();
+            String payUrl = alipayUtil.createWapPayUrl(orderNumber, totalAmount, subject);
+            String payForm = alipayUtil.createWapPayForm(orderNumber, totalAmount, subject);
+            return OrderPaymentVO.builder()
+                    .payMethod(2)
+                    .payUrl(payUrl)
+                    .payForm(payForm)
+                    .build();
+        }
+
+        // 微信支付：生成预支付交易单（JSAPI）
         Long userId = BaseContext.getCurrentId();
         User user = userMapper.getById(userId);
+        if (user == null || user.getOpenid() == null || user.getOpenid().trim().isEmpty()) {
+            throw new OrderBusinessException("微信用户openid为空，无法发起微信支付");
+        }
 
-        //调用微信支付接口，生成预支付交易单
         JSONObject jsonObject = weChatPayUtil.pay(
-                ordersPaymentDTO.getOrderNumber(), //商户订单号
-                new BigDecimal(0.01), //支付金额，单位 元
-                "苍穹外卖订单", //商品描述
-                user.getOpenid() //微信用户的openid
+                orderNumber,
+                payAmount,
+                subject,
+                user.getOpenid()
         );
 
         if (jsonObject.getString("code") != null && jsonObject.getString("code").equals("ORDERPAID")) {
@@ -224,9 +252,42 @@ public class OrderServiceImpl implements OrderService {
         }
 
         OrderPaymentVO vo = jsonObject.toJavaObject(OrderPaymentVO.class);
+        vo.setPayMethod(1);
         vo.setPackageStr(jsonObject.getString("package"));
-
         return vo;
+    }
+
+    /**
+     * Resolve order pay amount from DB first, then Redis pre-snapshot as fallback.
+     *
+     * <p>For local sandbox/testing, if not found, default to 0.01.</p>
+     */
+    private BigDecimal resolvePayAmount(String orderNumber) {
+        if (orderNumber == null || orderNumber.trim().isEmpty()) {
+            return new BigDecimal("0.01");
+        }
+
+        try {
+            Orders orders = orderMapper.getByNumber(orderNumber);
+            if (orders != null && orders.getAmount() != null) {
+                return orders.getAmount();
+            }
+        } catch (Exception ignored) {
+            // ignore and fallback to redis
+        }
+
+        try {
+            String snapshotJson = stringRedisTemplate.opsForValue().get("order:pre:" + orderNumber);
+            if (snapshotJson != null && !snapshotJson.isEmpty()) {
+                OrderPreSnapshot snapshot = JSON.parseObject(snapshotJson, OrderPreSnapshot.class);
+                if (snapshot != null && snapshot.getSubmitDTO() != null && snapshot.getSubmitDTO().getAmount() != null) {
+                    return snapshot.getSubmitDTO().getAmount();
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        return new BigDecimal("0.01");
     }
 
     /**
@@ -235,11 +296,15 @@ public class OrderServiceImpl implements OrderService {
      * @param outTradeNo
      */
     public void paySuccess(String outTradeNo) {
-        // 当前登录用户id
         Long userId = BaseContext.getCurrentId();
 
-        // 根据订单号查询当前用户的订单
-        Orders ordersDB = orderMapper.getByNumberAndUserId(outTradeNo, userId);
+        // 回调(微信/支付宝)场景下通常没有登录态：按订单号查询
+        Orders ordersDB;
+        if (userId != null) {
+            ordersDB = orderMapper.getByNumberAndUserId(outTradeNo, userId);
+        } else {
+            ordersDB = orderMapper.getByNumber(outTradeNo);
+        }
 
         // 异步下单场景下：用户可能在订单落库之前就触发支付回调
         if (ordersDB == null) {
@@ -250,6 +315,11 @@ public class OrderServiceImpl implements OrderService {
         }
         if (ordersDB == null) {
             throw new OrderBusinessException("订单不存在或正在创建，请稍后重试");
+        }
+
+        // 幂等：重复回调/重复点击，不重复推进状态
+        if (Orders.PAID.equals(ordersDB.getPayStatus())) {
+            return;
         }
 
         // 根据订单id更新订单的状态、支付方式、支付状态、结账时间
